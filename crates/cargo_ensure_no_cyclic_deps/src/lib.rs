@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! A cargo sub-command that detects cyclic dependencies between crates in a workspace. This is useful if you
 //! want to prevent dev-dependencies from creating dependency cycles as that can cause issues,
 //! e.g. for [`cargo-release`](https://github.com/crate-ci/cargo-release).
@@ -244,7 +246,7 @@ fn format_cycle(cycle: &[PackageId], metadata: &Metadata) -> String {
         .collect::<Vec<_>>()
         .join(" -> ")
 }
-#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {

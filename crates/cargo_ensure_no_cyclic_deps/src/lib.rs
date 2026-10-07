@@ -198,6 +198,7 @@ fn find_cycle_in_scc(graph: &DiGraph<PackageId, ()>, scc: &[NodeIndex]) -> Vec<P
 
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
+    visited.insert(start);
     queue.push_back((start, vec![start]));
 
     while let Some((curr, path)) = queue.pop_front() {

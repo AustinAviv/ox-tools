@@ -249,3 +249,37 @@ fn format_cycle(cycle: &[PackageId], metadata: &Metadata) -> String {
         .collect::<Vec<_>>()
         .join(" -> ")
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scc_cycle_ignores_self_loop_on_start_node() {
+        let mut graph = DiGraph::<PackageId, ()>::new();
+        let a = graph.add_node(PackageId {
+            repr: "crate_a 0.1.0".to_owned(),
+        });
+        let b = graph.add_node(PackageId {
+            repr: "crate_b 0.1.0".to_owned(),
+        });
+        let c = graph.add_node(PackageId {
+            repr: "crate_c 0.1.0".to_owned(),
+        });
+
+        // a -> a (self-loop on start node)
+        graph.add_edge(a, a, ());
+        // a -> b -> c -> a (multi-node cycle)
+        graph.add_edge(a, b, ());
+        graph.add_edge(b, c, ());
+        graph.add_edge(c, a, ());
+
+        let scc = vec![a, b, c];
+        let cycle = find_cycle_in_scc(&graph, &scc);
+        assert_eq!(cycle.len(), 3);
+        assert_eq!(cycle[0].repr, "crate_a 0.1.0");
+        assert_eq!(cycle[1].repr, "crate_b 0.1.0");
+        assert_eq!(cycle[2].repr, "crate_c 0.1.0");
+    }
+}

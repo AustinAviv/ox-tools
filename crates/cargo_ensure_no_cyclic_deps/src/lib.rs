@@ -60,14 +60,14 @@
     html_favicon_url = "https://media.githubusercontent.com/media/microsoft/ox-tools/refs/heads/main/crates/cargo_ensure_no_cyclic_deps/favicon.ico"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::ExitCode;
 
 use cargo_metadata::{Metadata, MetadataCommand, PackageId};
 use clap::Parser;
 use ohno::{AppError, IntoAppError};
 use petgraph::algo::tarjan_scc;
-use petgraph::graph::DiGraph;
+use petgraph::graph::{DiGraph, NodeIndex};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -173,7 +173,7 @@ fn detect_cycles(metadata: &Metadata) -> Vec<Vec<PackageId>> {
     let mut cycles: Vec<Vec<PackageId>> = sccs
         .into_iter()
         .filter(|scc| scc.len() > 1)
-        .map(|scc| scc.iter().map(|&idx| graph[idx].clone()).collect())
+        .map(|scc| find_cycle_in_scc(&graph, &scc))
         .collect();
 
     // Detect self-loops (a node depending on itself)
@@ -191,9 +191,37 @@ fn detect_cycles(metadata: &Metadata) -> Vec<Vec<PackageId>> {
     cycles
 }
 
+/// Finds a directed cycle path within an SCC by traversing graph edges.
+fn find_cycle_in_scc(graph: &DiGraph<PackageId, ()>, scc: &[NodeIndex]) -> Vec<PackageId> {
+    let scc_set: HashSet<NodeIndex> = scc.iter().copied().collect();
+    let start = scc[0];
+
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+    queue.push_back((start, vec![start]));
+
+    while let Some((curr, path)) = queue.pop_front() {
+        for neighbor in graph.neighbors(curr) {
+            if !scc_set.contains(&neighbor) {
+                continue;
+            }
+            if neighbor == start && path.len() > 1 {
+                return path.into_iter().map(|idx| graph[idx].clone()).collect();
+            }
+            if visited.insert(neighbor) {
+                let mut next_path = path.clone();
+                next_path.push(neighbor);
+                queue.push_back((neighbor, next_path));
+            }
+        }
+    }
+
+    scc.iter().map(|&idx| graph[idx].clone()).collect()
+}
+
 /// Format a cycle for display
 fn format_cycle(cycle: &[PackageId], metadata: &Metadata) -> String {
-    let names: Vec<String> = cycle
+    let mut names: Vec<String> = cycle
         .iter()
         .map(|id| {
             metadata
@@ -203,6 +231,15 @@ fn format_cycle(cycle: &[PackageId], metadata: &Metadata) -> String {
                 .map_or_else(|| id.to_string(), |p| p.name.to_string())
         })
         .collect();
+
+    if let Some(min_idx) = names
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, name)| *name)
+        .map(|(idx, _)| idx)
+    {
+        names.rotate_left(min_idx);
+    }
 
     names
         .iter()

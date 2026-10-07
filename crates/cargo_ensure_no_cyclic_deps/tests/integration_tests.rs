@@ -37,11 +37,7 @@ fn test_workspace_with_cycle() {
         .code(1)
         .stderr(predicate::str::contains("Error: Cyclic dependencies detected!"))
         .stderr(predicate::str::contains("Cycle 1:"))
-        .stderr(
-            predicate::str::contains("crate_a")
-                .and(predicate::str::contains("crate_b"))
-                .and(predicate::str::contains("crate_c")),
-        );
+        .stderr(predicate::str::contains("crate_a -> crate_b -> crate_c -> crate_a"));
 }
 
 #[test]

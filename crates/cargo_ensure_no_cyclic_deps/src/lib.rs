@@ -270,16 +270,18 @@ mod tests {
 
         // a -> a (self-loop on start node)
         graph.add_edge(a, a, ());
-        // a -> b -> c -> a (multi-node cycle)
+        // a -> b -> a and a -> c -> a: no cycle contains every SCC node.
         graph.add_edge(a, b, ());
-        graph.add_edge(b, c, ());
+        graph.add_edge(b, a, ());
+        graph.add_edge(a, c, ());
         graph.add_edge(c, a, ());
 
         let scc = vec![a, b, c];
         let cycle = find_cycle_in_scc(&graph, &scc);
-        assert_eq!(cycle.len(), 3);
+        assert_eq!(cycle.len(), 2);
         assert_eq!(cycle[0].repr, "crate_a 0.1.0");
-        assert_eq!(cycle[1].repr, "crate_b 0.1.0");
-        assert_eq!(cycle[2].repr, "crate_c 0.1.0");
+        assert!(
+            cycle[1].repr == "crate_b 0.1.0" || cycle[1].repr == "crate_c 0.1.0"
+        );
     }
 }

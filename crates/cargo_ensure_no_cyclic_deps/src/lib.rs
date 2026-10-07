@@ -233,12 +233,7 @@ fn format_cycle(cycle: &[PackageId], metadata: &Metadata) -> String {
         })
         .collect();
 
-    if let Some(min_idx) = names
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, name)| *name)
-        .map(|(idx, _)| idx)
-    {
+    if let Some(min_idx) = names.iter().enumerate().min_by_key(|(_, name)| *name).map(|(idx, _)| idx) {
         names.rotate_left(min_idx);
     }
 
@@ -280,8 +275,6 @@ mod tests {
         let cycle = find_cycle_in_scc(&graph, &scc);
         assert_eq!(cycle.len(), 2);
         assert_eq!(cycle[0].repr, "crate_a 0.1.0");
-        assert!(
-            cycle[1].repr == "crate_b 0.1.0" || cycle[1].repr == "crate_c 0.1.0"
-        );
+        assert!(cycle[1].repr == "crate_b 0.1.0" || cycle[1].repr == "crate_c 0.1.0");
     }
 }

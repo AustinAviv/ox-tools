@@ -244,7 +244,7 @@ fn format_cycle(cycle: &[PackageId], metadata: &Metadata) -> String {
         .collect::<Vec<_>>()
         .join(" -> ")
 }
-
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {

@@ -54,6 +54,13 @@
 //! ```
 //!
 //! The tool will exit with code 0 if no cycles are found, or code 1 if cycles are detected.
+//!
+//! # Cycle Reporting
+//!
+//! When multiple cycles exist within the same strongly connected component,
+//! the tool reports one representative directed cycle for that component,
+//! with self-loops reported separately. Resolving the reported cycle may
+//! reveal remaining cycles in the same component on subsequent runs.
 
 #![doc(
     html_logo_url = "https://media.githubusercontent.com/media/microsoft/ox-tools/refs/heads/main/crates/cargo_ensure_no_cyclic_deps/logo.png"
@@ -203,13 +210,15 @@ fn find_cycle_in_scc(graph: &DiGraph<PackageId, ()>, scc: &[NodeIndex]) -> Vec<P
     visited.insert(start);
     queue.push_back((start, vec![start]));
 
+    let mut cycle = None;
     while let Some((curr, path)) = queue.pop_front() {
         for neighbor in graph.neighbors(curr) {
             if !scc_set.contains(&neighbor) {
                 continue;
             }
             if neighbor == start && path.len() > 1 {
-                return path.into_iter().map(|idx| graph[idx].clone()).collect();
+                cycle = Some(path.into_iter().map(|idx| graph[idx].clone()).collect());
+                break;
             }
             if visited.insert(neighbor) {
                 let mut next_path = path.clone();
@@ -217,9 +226,12 @@ fn find_cycle_in_scc(graph: &DiGraph<PackageId, ()>, scc: &[NodeIndex]) -> Vec<P
                 queue.push_back((neighbor, next_path));
             }
         }
+        if cycle.is_some() {
+            break;
+        }
     }
 
-    scc.iter().map(|&idx| graph[idx].clone()).collect()
+    cycle.expect("guarded by Tarjan SCC invariant that every multi-node component contains a directed cycle back to start")
 }
 
 /// Format a cycle for display
@@ -235,9 +247,12 @@ fn format_cycle(cycle: &[PackageId], metadata: &Metadata) -> String {
         })
         .collect();
 
-    if let Some(min_idx) = names.iter().enumerate().min_by_key(|(_, name)| *name).map(|(idx, _)| idx) {
-        names.rotate_left(min_idx);
-    }
+    let (min_idx, _) = names
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, name)| *name)
+        .expect("guarded by caller invariant that cycle contains at least one package");
+    names.rotate_left(min_idx);
 
     names
         .iter()
@@ -264,19 +279,25 @@ mod tests {
         let c = graph.add_node(PackageId {
             repr: "crate_c 0.1.0".to_owned(),
         });
+        let d = graph.add_node(PackageId {
+            repr: "crate_d 0.1.0".to_owned(),
+        });
 
-        // a -> a (self-loop on start node)
-        graph.add_edge(a, a, ());
         // a -> b -> a and a -> c -> a: no cycle contains every SCC node.
         graph.add_edge(a, b, ());
         graph.add_edge(b, a, ());
         graph.add_edge(a, c, ());
         graph.add_edge(c, a, ());
+        // a -> d: external dependency outside the SCC to verify scc_set filtering.
+        graph.add_edge(a, d, ());
+        // a -> a: self-loop on start node, added last so petgraph visits it first
+        // among outgoing edges, verifying the start visited guard skips it.
+        graph.add_edge(a, a, ());
 
         let scc = vec![a, b, c];
         let cycle = find_cycle_in_scc(&graph, &scc);
         assert_eq!(cycle.len(), 2);
         assert_eq!(cycle[0].repr, "crate_a 0.1.0");
-        assert!(cycle[1].repr == "crate_b 0.1.0" || cycle[1].repr == "crate_c 0.1.0");
+        assert_eq!(cycle[1].repr, "crate_c 0.1.0");
     }
 }

@@ -15,11 +15,18 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::{fs, thread};
+use std::{env, fs, thread};
 
 use camino::Utf8PathBuf;
-use cargo_gamma_lib::testing::{Sink, gamma_base, run};
+use cargo_gamma_lib::testing::{Sink, gamma_base, run, write_fixture, write_project};
 use tempfile::TempDir;
+
+#[path = "support/child_test.rs"]
+mod child_test;
+#[path = "support/macros.rs"]
+mod macros;
+#[path = "support/rustflags.rs"]
+mod rustflags;
 
 /// Exit code for a run in which every gate passed.
 const EXIT_OK: i32 = 0;
@@ -208,21 +215,14 @@ fn cargo_runtime_environment_is_present() {
 /// Builds a throwaway crate containing `source`.
 fn workspace(source: &str) -> TempDir {
     let dir = TempDir::new().expect("could not create a temporary directory");
-    let root = dir.path();
-
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"subject\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
-    )
-    .expect("could not write the manifest");
-
-    fs::create_dir_all(root.join("src")).expect("could not create src");
-    fs::write(root.join("src/lib.rs"), source).expect("could not write the library");
+    write_project(dir.path(), &[("src/lib.rs", source)]);
 
     dir
 }
 
 /// Builds two test binaries that declare the same resource through both supported attribute scopes.
+///
+/// The generated crate has no dependencies and Cargo networking is disabled.
 fn resource_workspace() -> TempDir {
     let dir = workspace(
         "
@@ -232,21 +232,6 @@ pub fn accepts(value: u32) -> bool {
 ",
     );
     let root = dir.path();
-    let attrs = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("cargo-gamma-lib has a workspace parent")
-        .join("cargo-gamma-attrs")
-        .display()
-        .to_string()
-        .replace('\\', "/");
-    fs::write(
-        root.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"subject\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-             [dev-dependencies]\ngamma = {{ package = \"cargo-gamma-attrs\", path = \"{attrs}\" }}\n"
-        ),
-    )
-    .expect("could not write the resource fixture manifest");
     fs::create_dir_all(root.join("tests")).expect("could not create resource fixture tests");
 
     let support = r#"
@@ -273,102 +258,111 @@ fn hold_resource(scope: &str, peer: &str) {
     fs::remove_file(".resource-owner").expect("could not release resource ownership");
 }
 "#;
-    fs::write(
-        root.join("tests/function.rs"),
-        format!(
-            r#"{support}
+    let function = r#"
 #[gamma::resource("exclusive")]
 #[test]
-fn function_scoped_resource() {{
+fn function_scoped_resource() {
     hold_resource("function", "module");
     assert!(subject::accepts(1));
-}}
-"#
-        ),
-    )
-    .expect("could not write the function-scoped resource test");
-    fs::write(
-        root.join("tests/module.rs"),
-        format!(
-            r#"{support}
+}
+"#;
+    fs::write(root.join("tests/function.rs"), format!("{support}\n{function}")).expect("could not write the function-scoped resource test");
+    let module = r#"
 #[gamma::resource("exclusive")]
-mod resource_tests {{
+mod resource_tests {
     #[test]
-    fn module_scoped_resource() {{
+    fn module_scoped_resource() {
         super::hold_resource("module", "function");
         assert!(subject::accepts(1));
-    }}
-}}
-"#
-        ),
-    )
-    .expect("could not write the module-scoped resource test");
+    }
+}
+"#;
+    fs::write(root.join("tests/module.rs"), format!("{support}\n{module}")).expect("could not write the module-scoped resource test");
 
     dir
+}
+
+fn with_resource_workspace(test: &str, check: impl FnOnce(&Path)) {
+    const CHILD_ROOT: &str = "GAMMA_RESOURCE_MACRO_CHILD_ROOT";
+    if let Some(root) = env::var_os(CHILD_ROOT) {
+        check(Path::new(&root));
+        return;
+    }
+
+    let directory = resource_workspace();
+    let local_macro = macros::copy_gamma_macro(directory.path());
+    let external = format!("gamma={}", local_macro.display());
+    let mut configuration = toml_edit::DocumentMut::new();
+    configuration["build"]["rustflags"] = toml_edit::value(toml_edit::Array::from_iter(["--extern", external.as_str()]));
+    write_project(directory.path(), &[(".cargo/config.toml", &configuration.to_string())]);
+
+    let mut flags = rustflags::inherited();
+    for flag in ["--extern", external.as_str()] {
+        rustflags::append(&mut flags, flag);
+    }
+
+    // The parent owns the project while a child test uses its macro flags without mutating global environment.
+    let output = Command::new(env::current_exe().expect("the test harness has a current executable"))
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD_ROOT, directory.path())
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .output()
+        .expect("the resource test must be runnable in an isolated child process");
+    assert!(
+        output.status.success() && child_test::passed_exactly_one(&output.stdout),
+        "the child harness must execute and pass exactly one resource test:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Builds two workspace test targets, only one of which links the mutated package.
 fn compiler_linkage_workspace() -> TempDir {
     let dir = TempDir::new().expect("could not create a temporary directory");
-    let root = dir.path();
-
-    fs::write(
-        root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"subject\", \"oracle\", \"independent\"]\nresolver = \"2\"\n",
-    )
-    .expect("could not write the workspace manifest");
-
-    fs::create_dir_all(root.join("subject/src")).expect("could not create subject sources");
-    fs::write(
-        root.join("subject/Cargo.toml"),
-        "[package]\nname = \"subject\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ntest = false\n\n[dependencies]\n",
-    )
-    .expect("could not write the subject manifest");
-    fs::write(
-        root.join("subject/src/lib.rs"),
-        "pub fn is_adult(age: u32) -> bool {\n    age >= 18\n}\n",
-    )
-    .expect("could not write the mutated source");
-
-    fs::create_dir_all(root.join("oracle/src")).expect("could not create oracle sources");
-    fs::create_dir_all(root.join("oracle/tests")).expect("could not create oracle tests");
-    fs::write(
-        root.join("oracle/Cargo.toml"),
-        "[package]\nname = \"oracle\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-         [lib]\ntest = false\n\n[dependencies]\nsubject = { path = \"../subject\" }\n",
-    )
-    .expect("could not write the oracle manifest");
-    fs::write(root.join("oracle/src/lib.rs"), "").expect("could not write the oracle library");
-    fs::write(
-        root.join("oracle/tests/linked.rs"),
-        r"
+    write_project(
+        dir.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"subject\", \"oracle\", \"independent\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "subject/Cargo.toml",
+                "[package]\nname = \"subject\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\ntest = false\n\n[dependencies]\n",
+            ),
+            ("subject/src/lib.rs", "pub fn is_adult(age: u32) -> bool {\n    age >= 18\n}\n"),
+            (
+                "oracle/Cargo.toml",
+                "[package]\nname = \"oracle\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [lib]\ntest = false\n\n[dependencies]\nsubject = { path = \"../subject\" }\n",
+            ),
+            ("oracle/src/lib.rs", ""),
+            (
+                "oracle/tests/linked.rs",
+                r"
 #[test]
 fn reaches_the_subject_without_convicting_it() {
     let _unasserted = subject::is_adult(18);
 }
 ",
-    )
-    .expect("could not write the linked target");
-
-    fs::create_dir_all(root.join("independent/src")).expect("could not create independent sources");
-    fs::create_dir_all(root.join("independent/tests")).expect("could not create independent tests");
-    fs::write(
-        root.join("independent/Cargo.toml"),
-        "[package]\nname = \"independent\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-         [lib]\ntest = false\n\n[dependencies]\n",
-    )
-    .expect("could not write the independent manifest");
-    fs::write(root.join("independent/src/lib.rs"), "").expect("could not write the independent library");
-    fs::write(
-        root.join("independent/tests/independent.rs"),
-        r#"
+            ),
+            (
+                "independent/Cargo.toml",
+                "[package]\nname = \"independent\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [lib]\ntest = false\n\n[dependencies]\n",
+            ),
+            ("independent/src/lib.rs", ""),
+            (
+                "independent/tests/independent.rs",
+                r#"
 #[test]
 fn objects_to_mutants_it_cannot_link() {
     assert!(std::env::var_os("GAMMA_ACTIVE").is_none(), "an unrelated mutant was active");
 }
 "#,
-    )
-    .expect("could not write the independent target");
+            ),
+        ],
+    );
 
     dir
 }
@@ -405,9 +399,12 @@ fn environment_workspace() -> TempDir {
     let dir = TempDir::new().expect("could not create a temporary directory");
     let root = dir.path();
 
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\n\
+    write_project(
+        root,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\n\
          name = \"subject\"\n\
          version = \"1.2.3-alpha.1\"\n\
          edition = \"2021\"\n\
@@ -420,19 +417,17 @@ fn environment_workspace() -> TempDir {
          license-file = \"LICENSE\"\n\
          readme = \"README.md\"\n\n\
          [dependencies]\n",
-    )
-    .expect("could not write the manifest");
-    fs::write(root.join("LICENSE"), "fixture license").expect("could not write the license");
-    fs::write(root.join("README.md"), "fixture readme").expect("could not write the readme");
-    fs::write(
-        root.join("build.rs"),
-        "fn main() { println!(\"cargo::rustc-env=SUBJECT_BUILD_VALUE=ready\"); }\n",
-    )
-    .expect("could not write the build script");
-
-    fs::create_dir_all(root.join("src/bin")).expect("could not create src/bin");
-    fs::write(root.join("src/lib.rs"), SUBJECT).expect("could not write the library");
-    fs::write(root.join("src/bin/subject-cli.rs"), "fn main() {}\n").expect("could not write the binary");
+            ),
+            ("LICENSE", "fixture license"),
+            ("README.md", "fixture readme"),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::rustc-env=SUBJECT_BUILD_VALUE=ready\"); }\n",
+            ),
+            ("src/lib.rs", SUBJECT),
+            ("src/bin/subject-cli.rs", "fn main() {}\n"),
+        ],
+    );
 
     let rustup_available = Command::new("rustup")
         .args(["show", "active-toolchain"])
@@ -541,22 +536,27 @@ fn archipelago() -> TempDir {
     let dir = TempDir::new().expect("could not create a temporary directory");
     let root = dir.path();
 
-    fs::write(
-        root.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"mainland\", \"island\"]\nresolver = \"2\"\n",
-    )
-    .expect("could not write the workspace manifest");
+    write_project(
+        root,
+        &[(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"mainland\", \"island\"]\nresolver = \"2\"\n",
+        )],
+    );
 
     for (name, extra) in [("mainland", ""), ("island", "\n[lib]\ntest = false\n")] {
         let package = root.join(name);
 
-        fs::create_dir_all(package.join("src")).expect("could not create src");
-        fs::write(
-            package.join("Cargo.toml"),
-            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{extra}"),
-        )
-        .expect("could not write the manifest");
-        fs::write(package.join("src/lib.rs"), SUBJECT).expect("could not write the library");
+        write_fixture(
+            &package,
+            &[
+                (
+                    "Cargo.toml",
+                    &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{extra}"),
+                ),
+                ("src/lib.rs", SUBJECT),
+            ],
+        );
     }
 
     dir
@@ -644,18 +644,18 @@ fn session(dir: &TempDir, args: &[&str]) -> (i32, String) {
 fn censused_session(dir: &TempDir, args: &[&str]) -> (i32, String) {
     let mut args = args.to_vec();
     args.push("--optimize-test-execution");
-    let (code, out, err) = session_on_with(Sink::default(), dir, &args, false);
+    let (code, out, err) = session_on_with(Sink::default(), dir.path(), &args, false);
 
     (code, format!("{out}{err}"))
 }
 
 /// Runs a session on a given host, keeping the two streams apart.
 fn session_on(host: Sink, dir: &TempDir, args: &[&str]) -> (i32, String, String) {
-    session_on_with(host, dir, args, true)
+    session_on_with(host, dir.path(), args, true)
 }
 
-fn session_on_with(mut host: Sink, dir: &TempDir, args: &[&str], whole_test_binaries: bool) -> (i32, String, String) {
-    let path = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("path is not UTF-8");
+fn session_on_with(mut host: Sink, root: &Path, args: &[&str], whole_test_binaries: bool) -> (i32, String, String) {
+    let path = Utf8PathBuf::from_path_buf(root.to_path_buf()).expect("path is not UTF-8");
     let mut command = vec!["cargo-gamma".to_owned(), "gamma".to_owned(), "run".to_owned()];
 
     if !args.contains(&"--jobs") {
@@ -765,7 +765,7 @@ mod tests {
     fs::remove_dir_all(scratch_base(&dir)).expect("the second campaign should not see the first run record");
     fs::write(dir.path().join("src/lib.rs"), second_source).expect("could not change the mutant identity");
 
-    let (second, out, err) = session_on_with(Sink::default(), &dir, &["--mutators", "relational", "--diag"], false);
+    let (second, out, err) = session_on_with(Sink::default(), dir.path(), &["--mutators", "relational", "--diag"], false);
     let second_output = format!("{out}{err}");
 
     assert_eq!(second, EXIT_OK, "{second_output}");
@@ -1082,25 +1082,50 @@ fn the_config_file_is_honoured_by_a_real_run() {
 }
 
 #[test]
+fn resource_fixture_builds_without_a_registry_cache() {
+    step_aside_if_nested!();
+    with_resource_workspace("resource_fixture_builds_without_a_registry_cache", |root| {
+        let cargo_home = TempDir::new().expect("could not create an empty Cargo home");
+        let built = Command::new(env!("CARGO"))
+            .current_dir(root)
+            .env("CARGO_HOME", cargo_home.path())
+            .args(["test", "--offline", "--no-run", "--target-dir"])
+            .arg(root.join("target"))
+            .output()
+            .expect("Cargo must be installed to build this test suite");
+
+        assert!(
+            built.status.success(),
+            "the resource fixture must build offline with an empty Cargo home:\n{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+    });
+}
+
+#[test]
 fn resource_attributes_serialize_function_and_module_scopes_end_to_end() {
     step_aside_if_nested!();
-    let dir = resource_workspace();
-    let (code, output) = session(
-        &dir,
-        &[
-            "--mutators",
-            "relational",
-            "--jobs",
-            "4",
-            "--resource-concurrency",
-            "exclusive=1",
-            "--minimum-test-timeout",
-            "5",
-        ],
-    );
+    with_resource_workspace("resource_attributes_serialize_function_and_module_scopes_end_to_end", |root| {
+        let (code, out, err) = session_on_with(
+            Sink::default(),
+            root,
+            &[
+                "--mutators",
+                "relational",
+                "--jobs",
+                "4",
+                "--resource-concurrency",
+                "exclusive=1",
+                "--minimum-test-timeout",
+                "5",
+            ],
+            true,
+        );
+        let output = format!("{out}{err}");
 
-    assert_eq!(code, EXIT_OK, "{output}");
-    assert!(!dir.path().join(".resource-overlap").exists(), "{output}");
+        assert_eq!(code, EXIT_OK, "{output}");
+        assert!(!root.join(".resource-overlap").exists(), "{output}");
+    });
 }
 
 #[test]
@@ -1351,23 +1376,16 @@ fn a_merged_score_gate_can_fail_the_build() {
 /// its own plumbing.
 fn split_oracle() -> TempDir {
     let dir = TempDir::new().expect("could not create a temporary directory");
-    let root = dir.path();
-
-    fs::write(
-        root.join("Cargo.toml"),
-        "[package]\nname = \"subject\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
-    )
-    .expect("could not write the manifest");
-
-    fs::create_dir_all(root.join("src")).expect("could not create src");
-    fs::write(root.join("src/lib.rs"), "pub fn is_adult(age: u32) -> bool {\n    age >= 18\n}\n").expect("could not write the library");
-
-    fs::create_dir_all(root.join("tests")).expect("could not create tests");
-    fs::write(
-        root.join("tests/pinned.rs"),
-        "#[test]\nfn the_boundary_is_pinned() {\n    assert!(!subject::is_adult(17));\n    assert!(subject::is_adult(18));\n}\n",
-    )
-    .expect("could not write the integration test");
+    write_project(
+        dir.path(),
+        &[
+            ("src/lib.rs", "pub fn is_adult(age: u32) -> bool {\n    age >= 18\n}\n"),
+            (
+                "tests/pinned.rs",
+                "#[test]\nfn the_boundary_is_pinned() {\n    assert!(!subject::is_adult(17));\n    assert!(subject::is_adult(18));\n}\n",
+            ),
+        ],
+    );
 
     dir
 }

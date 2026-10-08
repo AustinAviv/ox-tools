@@ -2303,7 +2303,8 @@ mod tests {
     #[test]
     fn a_package_reaches_itself() {
         // Otherwise every mutant in a leaf crate would be reported as unreachable by its own tests.
-        let metadata = load_metadata(Utf8Path::new(env!("CARGO_MANIFEST_DIR")), &FeatureArgs::default()).expect("metadata");
+        let (_directory, root) = registry_workspace(false);
+        let metadata = load_metadata(&root, &FeatureArgs::default()).expect("metadata");
         let reach = reachable(&metadata);
 
         for (package, reachable_from) in &reach {
@@ -2313,7 +2314,8 @@ mod tests {
 
     #[test]
     fn a_dependent_reaches_what_it_depends_on() {
-        let metadata = load_metadata(Utf8Path::new(env!("CARGO_MANIFEST_DIR")), &FeatureArgs::default()).expect("metadata");
+        let (_directory, root) = registry_workspace(false);
+        let metadata = load_metadata(&root, &FeatureArgs::default()).expect("metadata");
         let reach = reachable(&metadata);
 
         // The binary crate is deliberately thin and defers everything to the library, so it must
@@ -2325,6 +2327,46 @@ mod tests {
         let from_library = reach.get("cargo-gamma-lib").expect("the library is a workspace member");
 
         assert!(!from_library.contains("cargo-gamma"), "{from_library:?}");
+    }
+
+    /// A tiny local graph whose registry package is supplied entirely by embedded directory assets.
+    fn registry_workspace(build_script: bool) -> (TempDir, Utf8PathBuf) {
+        let directory = TempDir::new().expect("a temporary directory");
+        let root = Utf8PathBuf::from_path_buf(directory.path().to_path_buf()).expect("UTF-8 fixture path");
+        crate::testing::write_project(
+            root.as_std_path(),
+            &[
+                ("Cargo.toml", "[workspace]\nmembers = [\"library\", \"binary\"]\nresolver = \"2\"\n"),
+                (
+                    "library/Cargo.toml",
+                    "[package]\nname = \"cargo-gamma-lib\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+                     [dependencies]\nblake3 = \"=0.1.0\"\n",
+                ),
+                ("library/src/lib.rs", "pub fn accepts(value: u32) -> bool { value >= 1 }\n"),
+                (
+                    "binary/Cargo.toml",
+                    "[package]\nname = \"cargo-gamma\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\
+                     [dependencies]\ncargo-gamma-lib = { path = \"../library\" }\n",
+                ),
+                ("binary/src/main.rs", "fn main() { assert!(cargo_gamma_lib::accepts(1)); }\n"),
+                (
+                    "vendor/blake3/Cargo.toml",
+                    "[package]\nname = \"blake3\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("vendor/blake3/src/lib.rs", "pub fn marker() {}\n"),
+                ("vendor/blake3/.cargo-checksum.json", "{\"files\":{},\"package\":null}\n"),
+                (
+                    ".cargo/config.toml",
+                    "[source.crates-io]\nreplace-with = \"embedded\"\n\
+                     [source.embedded]\ndirectory = \"vendor\"\n",
+                ),
+            ],
+        );
+        if build_script {
+            crate::testing::write_fixture(root.as_std_path(), &[("vendor/blake3/build.rs", "fn main() {}\n")]);
+        }
+
+        (directory, root)
     }
 
     /// Exhaustively checks [`reachable_ids`] against the same breadth-first search the previous
@@ -2535,21 +2577,27 @@ mod tests {
         let root = container.join("workspace");
         let dependency = container.join("dependency");
 
-        fs::create_dir_all(root.join("src")).expect("workspace source");
-        fs::create_dir_all(dependency.join("src")).expect("dependency source");
-        fs::write(
-            root.join("Cargo.toml"),
-            "[workspace]\n\n[package]\nname = \"workspace\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndependency = { path = \"../dependency\" }\n",
-        )
-        .expect("workspace manifest");
-        fs::write(root.join("src/lib.rs"), "pub fn workspace() {}\n").expect("workspace source");
-        fs::write(
-            dependency.join("Cargo.toml"),
-            "[package]\nname = \"dependency\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .expect("dependency manifest");
-        fs::write(dependency.join("src/lib.rs"), "pub fn dependency() {}\n").expect("dependency source");
-        fs::write(dependency.join("build.rs"), "fn main() {}\n").expect("dependency build script");
+        crate::testing::write_project(
+            root.as_std_path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[workspace]\n\n[package]\nname = \"workspace\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndependency = { path = \"../dependency\" }\n",
+                ),
+                ("src/lib.rs", "pub fn workspace() {}\n"),
+            ],
+        );
+        crate::testing::write_fixture(
+            dependency.as_std_path(),
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"dependency\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                ),
+                ("src/lib.rs", "pub fn dependency() {}\n"),
+                ("build.rs", "fn main() {}\n"),
+            ],
+        );
 
         let inputs = external_path_inputs(&root, &FeatureArgs::default(), &root).expect("metadata");
 
@@ -2630,9 +2678,9 @@ mod tests {
 
     #[test]
     fn a_registry_build_script_makes_the_snapshot_uncacheable() {
-        let root = Utf8Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (_directory, root) = registry_workspace(true);
         let mut command = MetadataCommand::new();
-        let _builder = command.current_dir(root);
+        let _builder = command.current_dir(&root);
         let metadata = command.exec().expect("workspace metadata");
         let blake3 = metadata
             .packages
@@ -3052,7 +3100,8 @@ mod tests {
         // Regression, issue-006. Only a *path* dependency can lead back into the workspace. Marking
         // a package opaque for an ordinary crates.io dependency would make almost every real
         // workspace reach everything, undoing the scoping this whole graph exists for.
-        let metadata = load_metadata(Utf8Path::new(env!("CARGO_MANIFEST_DIR")), &FeatureArgs::default()).expect("metadata");
+        let (_directory, root) = registry_workspace(false);
+        let metadata = load_metadata(&root, &FeatureArgs::default()).expect("metadata");
         let reach = reachable(&metadata);
         let from_library = reach.get("cargo-gamma-lib").expect("the library is a workspace member");
 
@@ -3591,11 +3640,19 @@ mod tests {
     }
 
     fn write(root: &Utf8Path, relative: &str, text: &str) {
-        let path = root.join(relative);
+        if matches!(relative, "Cargo.toml" | ".cargo/config" | ".cargo/config.toml") {
+            crate::testing::write_project(root.as_std_path(), &[(relative, text)]);
+        } else {
+            crate::testing::write_fixture(root.as_std_path(), &[(relative, text)]);
+        }
+    }
 
-        fs::create_dir_all(path.parent().expect("every fixture path has a parent").as_std_path())
-            .expect("could not create the fixture directory");
-        fs::write(path.as_std_path(), text).expect("could not write the fixture file");
+    fn assert_offline_configuration(root: &Utf8Path) {
+        let document: toml_edit::DocumentMut = fs::read_to_string(root.join(".cargo/config.toml"))
+            .expect("the project fixture has a Cargo configuration")
+            .parse()
+            .expect("project fixtures contain valid Cargo configuration");
+        assert_eq!(document["net"]["offline"].as_bool(), Some(true));
     }
 
     /// The walk is the sole producer of the candidate file list, and a walk error is per entry: a
@@ -3666,12 +3723,12 @@ mod tests {
         let (_directory, root) = workspace();
         let target = root.join("configured-target");
 
-        fs::create_dir_all(root.join(".cargo")).expect("cargo configuration directory");
-        fs::write(
-            root.join(".cargo/config.toml"),
-            format!("[build]\ntarget-dir = '{}'\n", target.as_str()),
-        )
-        .expect("cargo configuration");
+        write(
+            &root,
+            ".cargo/config.toml",
+            &format!("[build]\ntarget-dir = '{}'\n", target.as_str()),
+        );
+        assert_offline_configuration(&root);
 
         let survey = survey(&root, SelectArgs::default());
 
@@ -5167,6 +5224,7 @@ mod tests {
         assert!(!plain.iter().any(|item| item.contains("custom_only")), "{plain:?}");
 
         write(&root, ".cargo/config.toml", "[build]\nrustflags = [\"--cfg\", \"gamma_probe\"]\n");
+        assert_offline_configuration(&root);
 
         let flagged = mutated_items(&root, &CargoOptions::default());
 
